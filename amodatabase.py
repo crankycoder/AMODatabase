@@ -13,12 +13,13 @@ import os
 import shutil
 import typing
 import sys
-from pprint import pprint
+import urllib
+import pprint
 
 import requests
 from requests_toolbelt.threaded import pool
 
-MAX_PROCESSES = 50
+MAX_PROCESSES = 100
 DEFAULT_AMO_REQUEST_URI = "https://addons.mozilla.org/api/v3/addons/search/"
 QUERY_PARAMS = "?app=firefox&sort=created&type=extension"
 logger = logging.getLogger('amo_database')
@@ -38,7 +39,6 @@ def tinydb(fpath='/tmp/amo_cache'):
             with open(fname, 'w') as fout:
                 print ("Handled: %s" % guid)
                 fout.write(json.dumps(data))
-
     yield Cache(fpath)
 
 
@@ -94,6 +94,7 @@ class AMODatabase:
             for i in range(1, self._page_count+1):
                 url = "%s%s%s" % (DEFAULT_AMO_REQUEST_URI, QUERY_PARAMS, ("&page=%d" % i))
                 urls.append(url)
+            print("Processing AMO urls")
             p = pool.Pool.from_urls(urls, num_processes=MAX_PROCESSES)
             p.join_all()
 
@@ -105,46 +106,90 @@ class AMODatabase:
             p.join_all()
             self._handle_responses(p, db)
 
+    def fetch_versions(self):
+        def version_gen():
+            for i, fname in enumerate(os.listdir("/tmp/amo_cache")):
+                guid = fname.split(".json")[0]
+                url = "https://addons.mozilla.org/api/v3/addons/addon/%s/versions/" % guid
+                yield url
+
+        with tinydb(fpath='/tmp/amo_cache_dates') as date_db:
+            print("Processing Version urls")
+            p = pool.Pool.from_urls(version_gen(), num_processes=MAX_PROCESSES)
+            p.join_all()
+            last_page_urls = self._handle_version_responses(p)
+
+            # Now fetch the last version of each addon
+            print("Processing Last page urls: %d" % len(last_page_urls))
+            p = pool.Pool.from_urls(last_page_urls, num_processes=MAX_PROCESSES)
+            p.join_all()
+
+            print ("Writing create dates")
+            self._handle_last_version_responses(p, date_db)
+
+    def _handle_last_version_responses(self, p, db):
+        for resp in p.responses():
+            try:
+                if resp.status_code == 200:
+                    jdata = json.loads(resp.content.decode('utf8'))
+                    results = jdata['results']
+
+                    guid = resp.url.split("addon/")[1].split("/versions")[0]
+                    guid = urllib.parse.unquote(guid)
+                    create_date = results[-1]['files'][0]['created']
+
+                    record = {'guid': guid, 'create_date': create_date}
+                    db.put(record)
+                    print("GUID: %s  Create date: %s" % (guid, create_date))
+            except Exception as e:
+                # Skip this record
+                logger.error(e)
+
     def _handle_responses(self, p, db):
+        guids = []
         for resp in p.responses():
             try:
                 if resp.status_code == 200:
                     jdata = json.loads(resp.content.decode('utf8'))
                     results = jdata['results']
                     for record in results:
+                        guid = record['guid']
+                        guids.append(guid)
                         db.put(record)
             except Exception as e:
                 # Skip this record
                 logger.error(e)
+        return guids
+
+    def _handle_version_responses(self, p):
+        page_urls = []
+        for resp in p.responses():
+            try:
+                if resp.status_code == 200:
+                    jdata = json.loads(resp.content.decode('utf8'))
+                    page_count = jdata['page_count']
+                    page_urls.append(resp.url+"?page=%d" % page_count)
+            except Exception as e:
+                # Skip this record
+                logger.error(e)
+        return page_urls
 
 
 class Undefined:
     pass
 
 
-def is_container(type_def):
-    """
-    str and bytes are containers in python, but well - that's not
-    terribly useful
-    """
-    if issubclass(type_def, typing.Container) and type_def not in [str, bytes]:
-        return True
-    return False
-
-
 def fix_types(value, attr_name, type_def):
-    serializers = {
-        str: str,
-        typing.Dict: dict,
-        int: int,
-        float: float,
-        typing.List: list,
-        bool: bool,
-        }
+    serializers = {typing.List: list,
+                   typing.Dict: dict,
+                   str: str,
+                   int: int,
+                   float: float,
+                   bool: bool}
 
     if issubclass(type_def, JSONSchema):
         return marshal(type_def, value)
-    elif is_container(type_def):
+    elif issubclass(type_def, typing.Container) and type_def not in [str, bytes]:
         if issubclass(type_def, typing.List):
             item_type = type_def.__args__[0]
             return [fix_types(j, attr_name, item_type) for j in value]
@@ -157,7 +202,6 @@ def fix_types(value, attr_name, type_def):
                          for k, v in value.items()]
             return dict(dict_vals)
     else:
-        # This is a simple type
         return serializers[type_def](value)
 
 
@@ -171,14 +215,22 @@ def marshal(schema, json_data):
         if value is not Undefined:
             # Try marshalling the value
             obj[attr_name] = fix_types(value, attr_name, type_def)
-
     return obj
 
-def parse_file(fname):
-    jbdata = open('/tmp/amo_cache/%s' % fname, 'rb').read()
+
+def get_version_info(guid):
+    jbdata = open('/tmp/amo_cache_dates/%s.json' % guid, 'rb').read()
+    data = json.loads(jbdata.decode('utf8'))
+    return data['create_date']
+
+
+def parse_file(guid):
+    jbdata = open('/tmp/amo_cache/%s.json' % guid, 'rb').read()
     data = json.loads(jbdata.decode('utf8'))
     result = marshal(AMOAddonInfo, data)
-    pprint(result)
+    result['first_create_date'] = get_version_info(guid)
+    return result
+
 
 def main():
     print (datetime.datetime.now())
@@ -192,5 +244,9 @@ def main():
 if __name__ == '__main__':
     # amodb = AMODatabase()
     # amodb.fetch_pages()
-    #main()
-    parse_file('{feb799e2-29e2-4e35-b862-cc4e1842b6f5}.json')
+    # main()
+    data = parse_file('{d10d0bf8-f5b5-c8b4-a8b2-2b9879e08c5d}')
+    pprint.pprint(data)
+
+    # amodb = AMODatabase()
+    # amodb.fetch_versions()
